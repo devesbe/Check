@@ -31,6 +31,7 @@ if (window.checkExtensionLoaded) {
   let showingBanner = false; // Flag to prevent DOM monitoring loops when showing banners
   const MAX_SCANS = 5; // Prevent infinite scanning - reduced for performance
   const SCAN_COOLDOWN = 1200; // 1200ms between scans - increased for performance
+  const WARNING_THRESHOLD = 3; // Block if 4+ warning threats found (escalation threshold)
   let initialBody; // Reference to the initial body element
 
   // Console log capturing
@@ -847,6 +848,14 @@ if (window.checkExtensionLoaded) {
    */
   function hasMicrosoftElements() {
     try {
+      const isExcludedDomain = checkDomainExclusion(window.location.href);
+      if (isExcludedDomain) {
+        logger.log(
+          `✅ Domain excluded from scanning - skipping Microsoft elements check: ${window.location.href}`
+        );
+        return false; // Skip phishing indicators for excluded domains
+      }
+
       if (!detectionRules?.m365_detection_requirements) {
         return false;
       }
@@ -1919,7 +1928,7 @@ if (window.checkExtensionLoaded) {
 
   /**
    * Check if domain should be excluded from phishing detection
-   * Now includes both detection rules exclusions AND user-configured URL whitelist
+   * Now includes both detection rules exclusions AND user-configured URL allowlist
    */
   function checkDomainExclusion(url) {
     if (detectionRules?.exclusion_system?.domain_patterns) {
@@ -1939,26 +1948,26 @@ if (window.checkExtensionLoaded) {
         return true;
       }
     }
-    return checkUserUrlWhitelist(url);
+    return checkUserUrlAllowlist(url);
   }
 
   /**
-   * Check if URL matches user-configured whitelist patterns
+   * Check if URL matches user-configured allowlist patterns
    */
-  function checkUserUrlWhitelist(url) {
+  function checkUserUrlAllowlist(url) {
     try {
-      // Get URL whitelist from current config (loaded from storage)
-      if (!window.checkUserConfig?.urlWhitelist) {
+      // Get URL allowlist from current config (loaded from storage)
+      if (!window.checkUserConfig?.urlAllowlist) {
         return false;
       }
 
-      const urlWhitelist = window.checkUserConfig.urlWhitelist;
-      if (!Array.isArray(urlWhitelist) || urlWhitelist.length === 0) {
+      const urlAllowlist = window.checkUserConfig.urlAllowlist;
+      if (!Array.isArray(urlAllowlist) || urlAllowlist.length === 0) {
         return false;
       }
 
-      // Test URL against each whitelist pattern
-      for (const pattern of urlWhitelist) {
+      // Test URL against each allowlist pattern
+      for (const pattern of urlAllowlist) {
         if (!pattern || !pattern.trim()) continue;
 
         try {
@@ -1968,18 +1977,18 @@ if (window.checkExtensionLoaded) {
 
           if (regex.test(url)) {
             logger.log(
-              `✅ URL whitelisted by user pattern "${pattern}": ${url}`
+              `✅ URL allowlisted by user pattern "${pattern}": ${url}`
             );
             return true;
           }
         } catch (error) {
-          logger.warn(`Invalid URL whitelist pattern: ${pattern}`, error);
+          logger.warn(`Invalid URL allowlist pattern: ${pattern}`, error);
         }
       }
 
       return false;
     } catch (error) {
-      logger.warn("Error checking user URL whitelist:", error);
+      logger.warn("Error checking user URL allowlist:", error);
       return false;
     }
   }
@@ -2336,32 +2345,32 @@ if (window.checkExtensionLoaded) {
         } chars content`
       );
 
-      // Load configuration to check protection settings and URL whitelist
+      // Load configuration to check protection settings and URL allowlist
       const config = await new Promise((resolve) => {
         chrome.storage.local.get(["config"], (result) => {
           resolve(result.config || {});
         });
       });
 
-      // Store config globally for URL whitelist checking
+      // Store config globally for URL allowlist checking
       window.checkUserConfig = config;
 
-      // Early exit if URL is in user whitelist (before any other checks)
-      if (checkUserUrlWhitelist(window.location.href)) {
+      // Early exit if URL is in user allowlist (before any other checks)
+      if (checkUserUrlAllowlist(window.location.href)) {
         logger.log(
-          `✅ URL WHITELISTED BY USER - No scanning needed, exiting immediately`
+          `✅ URL ALLOWLISTED BY USER - No scanning needed, exiting immediately`
         );
         logger.log(
-          `📋 URL matches user whitelist pattern: ${window.location.href}`
+          `📋 URL matches user allowlist pattern: ${window.location.href}`
         );
 
-        // Log as legitimate access for whitelisted URLs (only on first run)
+        // Log as legitimate access for allowlisted URLs (only on first run)
         if (!isRerun) {
           logProtectionEvent({
             type: "legitimate_access",
             url: location.href,
             origin: location.origin,
-            reason: "URL matches user-configured whitelist pattern",
+            reason: "URL matches user-configured allowlist pattern",
             redirectTo: null,
             clientId: null,
             clientSuspicious: false,
@@ -2369,7 +2378,7 @@ if (window.checkExtensionLoaded) {
           });
         }
 
-        return; // EXIT IMMEDIATELY - can't be phishing on user-whitelisted URL
+        return; // EXIT IMMEDIATELY - can't be phishing on user-allowlisted URL
       }
 
       // Check if page blocking is disabled
@@ -2813,15 +2822,25 @@ if (window.checkExtensionLoaded) {
           );
 
           if (warningThreats.length > 0) {
-            const reason = `Suspicious phishing indicators detected: ${warningThreats
-              .map((t) => t.id)
-              .join(", ")}`;
+            // Check if we have enough warning threats to escalate to blocking
+            const shouldEscalateToBlock =
+              warningThreats.length >= WARNING_THRESHOLD;
+
+            const reason = shouldEscalateToBlock
+              ? `Multiple phishing indicators detected on non-Microsoft page (${
+                  warningThreats.length
+                }/${WARNING_THRESHOLD} threshold exceeded): ${warningThreats
+                  .map((t) => t.id)
+                  .join(", ")}`
+              : `Suspicious phishing indicators detected: ${warningThreats
+                  .map((t) => t.id)
+                  .join(", ")}`;
 
             // Store detection result
             lastDetectionResult = {
-              verdict: "suspicious",
+              verdict: shouldEscalateToBlock ? "blocked" : "suspicious",
               isSuspicious: true,
-              isBlocked: false,
+              isBlocked: shouldEscalateToBlock && protectionEnabled,
               threats: warningThreats.map((t) => ({
                 type: t.category || t.id,
                 id: t.id,
@@ -2830,46 +2849,104 @@ if (window.checkExtensionLoaded) {
                 severity: t.severity,
               })),
               reason: reason,
-              score: 50, // Medium suspicion score
+              score: shouldEscalateToBlock ? 0 : 50, // Critical score if escalated
               threshold: 85,
               phishingIndicators: warningThreats.map((t) => t.id),
+              escalated: shouldEscalateToBlock,
+              escalationReason: shouldEscalateToBlock
+                ? `${warningThreats.length} warning threats exceeded threshold of ${WARNING_THRESHOLD}`
+                : null,
             };
 
-            logger.warn(
-              `⚠️ SUSPICIOUS CONTENT: Showing warning for phishing indicators`
-            );
-            showWarningBanner(`SUSPICIOUS CONTENT DETECTED: ${reason}`, {
-              threats: warningThreats,
-            });
+            if (shouldEscalateToBlock) {
+              logger.error(
+                `🚨 ESCALATED TO BLOCK: ${warningThreats.length} warning threats on non-Microsoft page exceeded threshold of ${WARNING_THRESHOLD}`
+              );
+
+              if (protectionEnabled) {
+                logger.error(
+                  "🛡️ PROTECTION ACTIVE: Blocking page due to escalated warning threats"
+                );
+                showBlockingOverlay(reason, {
+                  threats: warningThreats,
+                  score: phishingResult.score,
+                  escalated: true,
+                  escalationReason: `${warningThreats.length} warning threats exceeded threshold`,
+                });
+                disableFormSubmissions();
+                disableCredentialInputs();
+                stopDOMMonitoring();
+              } else {
+                logger.warn(
+                  "⚠️ PROTECTION DISABLED: Would block escalated threats but showing critical warning banner instead"
+                );
+                showWarningBanner(
+                  `CRITICAL THREATS DETECTED (ESCALATED): ${reason}`,
+                  {
+                    threats: warningThreats,
+                    severity: "critical", // Escalate banner severity
+                    escalated: true,
+                  }
+                );
+                if (!isRerun) {
+                  setupDOMMonitoring();
+                  setupDynamicScriptMonitoring();
+                }
+              }
+            } else {
+              logger.warn(
+                `⚠️ SUSPICIOUS CONTENT: Showing warning for ${warningThreats.length} phishing indicators on non-Microsoft page (below ${WARNING_THRESHOLD} threshold)`
+              );
+              showWarningBanner(`SUSPICIOUS CONTENT DETECTED: ${reason}`, {
+                threats: warningThreats,
+              });
+            }
 
             const redirectHostname = extractRedirectHostname(location.href);
             const clientInfo = await extractClientInfo(location.href);
 
             logProtectionEvent({
-              type: "threat_detected_no_action",
+              type: shouldEscalateToBlock
+                ? protectionEnabled
+                  ? "threat_blocked"
+                  : "threat_detected_no_action"
+                : "threat_detected_no_action",
               url: location.href,
               reason: reason,
-              severity: "medium",
+              severity: shouldEscalateToBlock ? "critical" : "medium",
               protectionEnabled: protectionEnabled,
               redirectTo: redirectHostname,
               clientId: clientInfo.clientId,
               clientSuspicious: clientInfo.isMalicious,
               clientReason: clientInfo.reason,
               phishingIndicators: warningThreats.map((t) => t.id),
+              escalated: shouldEscalateToBlock,
+              escalationReason: shouldEscalateToBlock
+                ? `${warningThreats.length} warning threats exceeded threshold of ${WARNING_THRESHOLD}`
+                : null,
+              warningThresholdCount: warningThreats.length,
             });
 
             sendCippReport({
-              type: "suspicious_content_detected",
+              type: shouldEscalateToBlock
+                ? "escalated_threats_blocked"
+                : "suspicious_content_detected",
               url: location.href,
               reason: reason,
-              severity: "medium",
+              severity: shouldEscalateToBlock ? "critical" : "medium",
               legitimate: false,
               timestamp: new Date().toISOString(),
               phishingIndicators: warningThreats.map((t) => t.id),
+              escalated: shouldEscalateToBlock,
+              escalationReason: shouldEscalateToBlock
+                ? `${warningThreats.length} warning threats exceeded threshold of ${WARNING_THRESHOLD}`
+                : null,
+              warningThresholdCount: warningThreats.length,
+              warningThreshold: WARNING_THRESHOLD,
             });
 
-            // Continue monitoring for suspicious pages
-            if (!isRerun) {
+            // Continue monitoring for suspicious pages (only if not escalated to block)
+            if (!shouldEscalateToBlock && !isRerun) {
               setupDOMMonitoring();
               setupDynamicScriptMonitoring();
             }
@@ -4005,6 +4082,129 @@ if (window.checkExtensionLoaded) {
       // Set flag to prevent DOM monitoring loops
       showingBanner = true;
 
+      // Fetch branding configuration (uniform pattern: storage only, like applyBrandingColors)
+      const fetchBranding = () => new Promise((resolve) => {
+        try {
+          chrome.storage.local.get(["brandingConfig"], (result) => {
+            resolve(result?.brandingConfig || {});
+          });
+        } catch(_) { resolve({}); }
+      });
+
+      const extractPhishingIndicators = (details) => {
+        if (!details) return "Unknown detection criteria";
+
+        // Try to extract phishing indicators from various possible fields
+        // This matches the exact logic from blocked.js openMailto function
+        if (details.phishingIndicators && Array.isArray(details.phishingIndicators)) {
+          return details.phishingIndicators
+            .map(indicator => `- ${indicator.id || indicator.name || "Unknown"}: ${indicator.description || indicator.reason || "Detected"}`)
+            .join("\n");
+        } else if (details.matchedRules && Array.isArray(details.matchedRules)) {
+          return details.matchedRules
+            .map(rule => `- ${rule.id || rule.name || "Unknown"}: ${rule.description || rule.reason || "Rule matched"}`)
+            .join("\n");
+        } else if (details.threats && Array.isArray(details.threats)) {
+          // Filter out the summary threat and show only specific indicators
+          const specificThreats = details.threats.filter((threat) => {
+            // Skip first threat if it's a summary (contains "legitimacy score" or is a general threat type)
+            // Keep threats with specific IDs (phishing rules)
+            if (threat.id && threat.id.startsWith("phi_")) {
+              return true;
+            }
+            // Keep threats with specific types that aren't summary types
+            if (threat.type && !threat.type.includes("threat") && threat.description) {
+              return true;
+            }
+            // Keep anything else that looks like a specific threat
+            return (threat.description && threat.description.length > 10 && threat.id);
+          });
+          return specificThreats
+            .map(threat => `- ${threat.type || threat.category || threat.id || "Phishing Indicator"}: ${threat.description || threat.reason || "Threat detected"}`)
+            .join("\n");
+        } else if (details.foundThreats && Array.isArray(details.foundThreats)) {
+          return details.foundThreats
+            .map(threat => `- ${threat.id || threat}: ${threat.description || "Detected"}`)
+            .join("\n");
+        } else if (details.indicators && Array.isArray(details.indicators)) {
+          return details.indicators
+            .map(indicator => `- ${indicator.id}: ${indicator.description || indicator.id} (${indicator.severity || "unknown"})`)
+            .join("\n");
+        } else if (details.foundIndicators && Array.isArray(details.foundIndicators)) {
+          return details.foundIndicators
+            .map(indicator => `- ${indicator.id || indicator}: ${indicator.description || ""}`)
+            .join("\n");
+        } else {
+          // Fallback: Look for any array properties that might contain indicators
+          const arrayProps = Object.keys(details).filter(key => Array.isArray(details[key]) && details[key].length > 0);
+          
+          if (arrayProps.length > 0) {
+            return `Multiple indicators detected (${details.reason || "see browser console for details"})`;
+          } else {
+            return `${details.reason || "Unknown detection criteria"}`;
+          }
+        }
+      };
+
+      const applyBranding = (bannerEl, branding) => {
+        if (!bannerEl) return;
+        try {
+          const companyName = branding.companyName || branding.productName || "CyberDrain";
+          const supportEmail = branding.supportEmail || "";
+          let logoUrl = branding.logoUrl || "";
+          const packagedFallback = chrome.runtime.getURL('images/icon48.png');
+          // Simplified: rely on upstream input validation; only fallback when empty/falsy
+          if (!logoUrl) {
+            logoUrl = packagedFallback;
+          }
+          let brandingSlot = bannerEl.querySelector('#check-banner-branding');
+          if (!brandingSlot) {
+            const container = document.createElement('div');
+            container.id = 'check-banner-branding';
+            container.style.cssText = 'display:flex;align-items:center;gap:8px;';
+            const innerWrapper = bannerEl.firstElementChild;
+            if (innerWrapper) innerWrapper.insertBefore(container, innerWrapper.firstChild);
+            brandingSlot = container;
+          }
+          if (brandingSlot) {
+            brandingSlot.innerHTML = '';
+            if (logoUrl) {
+              const img = document.createElement('img');
+              img.src = logoUrl;
+              img.alt = companyName + ' logo';
+              img.style.cssText = 'width:28px;height:28px;object-fit:contain;border-radius:4px;background:rgba(255,255,255,0.25);padding:2px;';
+              brandingSlot.appendChild(img);
+            }
+            const textWrap = document.createElement('div');
+            textWrap.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;line-height:1.2;';
+            const titleSpan = document.createElement('span');
+            titleSpan.style.cssText = 'font-size:12px;font-weight:600;';
+            titleSpan.textContent = 'Protected by ' + companyName;
+            textWrap.appendChild(titleSpan);
+            if (supportEmail) {
+              const contactDiv = document.createElement('div');
+              const contactLink = document.createElement('a');
+              contactLink.style.cssText = 'color:#fff;text-decoration:underline;font-size:11px;cursor:pointer;';
+              contactLink.textContent = 'Report as clean/safe';
+              contactLink.title = 'Report this page as clean/safe to your administrator';
+              contactLink.href = `mailto:${supportEmail}?subject=${encodeURIComponent('Security Review: Possible Clean/Safe Page')}`;
+              contactLink.addEventListener('click', (e) => {
+                try { chrome.runtime.sendMessage({ type: 'REPORT_FALSE_POSITIVE', url: location.href, reason }); } catch(_) {}
+                let indicatorsText;
+                try { indicatorsText = extractPhishingIndicators(analysisData); } catch(err) { indicatorsText = 'Parse error - see console'; }
+                const detectionScoreLine = analysisData?.score !== undefined ? `Detection Score: ${analysisData.score}/${analysisData.threshold}` : 'Detection Score: N/A';
+                const subject = `Security Review: Mark Clean - ${location.hostname}`;
+                const body = encodeURIComponent(`Security Review Request: Possible Clean/Safe Page\n\nPage URL: ${location.href}\nHostname: ${location.hostname}\nTimestamp (UTC): ${new Date().toISOString()}\nBanner Title: ${bannerTitle}\nDisplayed Reason: ${reason}\n${detectionScoreLine}\n\nDetected Indicators:\n${indicatorsText}\n\nUser Justification:\n[Explain why this page is safe]`);
+                e.currentTarget.href = `mailto:${supportEmail}?subject=${encodeURIComponent(subject)}&body=${body}`;
+              });
+              contactDiv.appendChild(contactLink);
+              textWrap.appendChild(contactDiv);
+            }
+            brandingSlot.appendChild(textWrap);
+          }
+        } catch(e) { /* non-fatal */ }
+      };
+
       const detailsText = analysisData?.score
         ? ` (Score: ${analysisData.score}/${analysisData.threshold})`
         : "";
@@ -4039,24 +4239,21 @@ if (window.checkExtensionLoaded) {
         bannerColor = "linear-gradient(135deg, #ff5722, #d84315)"; // Orange-red for high risk
       }
 
+      // Layout: left branding slot, absolutely centered message block, dismiss button on right.
       const bannerContent = `
-      <div style="display: flex; align-items: center; justify-content: center; gap: 16px; position: relative; padding-right: 48px;">
-        <span style="font-size: 24px;">${bannerIcon}</span>
-        <div>
-          <strong>${bannerTitle}</strong><br>
-          <small>${reason}${detailsText}</small>
+      <div style="position:relative;display:flex;align-items:center;gap:16px;min-height:56px;">
+        <div id="check-banner-left" style="display:flex;align-items:center;gap:12px;z-index:2;"></div>
+        <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;max-width:60%;z-index:1;pointer-events:none;">
+          <span style="display:block;font-size:24px;margin-bottom:4px;">${bannerIcon}</span>
+          <strong style="display:block;">${bannerTitle}</strong>
+          <small style="opacity:0.95;display:block;margin-top:2px;">${reason}${detailsText}</small>
         </div>
-        <button onclick="this.parentElement.parentElement.remove(); document.body.style.marginTop = '0'; window.showingBanner = false;" title="Dismiss" style="
-          position: absolute; right: 16px; top: 50%; transform: translateY(-50%);
-          background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3);
-          color: white; padding: 0; border-radius: 4px; cursor: pointer;
-          width: 24px; height: 24px; min-width: 24px; min-height: 24px; max-width: 24px; max-height: 24px;
-          display: flex; align-items: center; justify-content: center;
-          font-size: 14px; font-weight: bold; line-height: 1; box-sizing: border-box;
-          font-family: monospace;
-        ">×</button>
-      </div>
-    `;
+        <button onclick="this.closest('#ms365-warning-banner').remove(); document.body.style.marginTop = '0'; window.showingBanner = false;" title="Dismiss" style="
+          margin-left:auto;position:relative;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.3);
+          color:#fff;padding:0;border-radius:4px;cursor:pointer;
+          width:24px;height:24px;min-width:24px;min-height:24px;display:flex;align-items:center;justify-content:center;
+          font-size:14px;font-weight:bold;line-height:1;box-sizing:border-box;font-family:monospace;z-index:2;">×</button>
+      </div>`;
 
       // Check if banner already exists
       let banner = document.getElementById("ms365-warning-banner");
@@ -4065,6 +4262,7 @@ if (window.checkExtensionLoaded) {
         // Update existing banner content and color
         banner.innerHTML = bannerContent;
         banner.style.background = bannerColor;
+        fetchBranding().then(branding => applyBranding(banner, branding));
 
         // Ensure page content is still pushed down
         const bannerHeight = banner.offsetHeight || 64;
@@ -4094,18 +4292,16 @@ if (window.checkExtensionLoaded) {
       banner.innerHTML = bannerContent;
       document.body.appendChild(banner);
 
+      fetchBranding().then(branding => applyBranding(banner, branding));
+
       // Push page content down to avoid covering login header
       const bannerHeight = banner.offsetHeight || 64; // fallback height
       document.body.style.marginTop = `${bannerHeight}px`;
 
       logger.log("Warning banner displayed");
-
-      // Don't clear the showingBanner flag immediately - let it persist
-      // to prevent DOM monitoring from interfering while the user sees the warning
-      // The flag will be cleared when the banner is updated or removed
     } catch (error) {
       logger.error("Failed to show warning banner:", error.message);
-      showingBanner = false; // Make sure flag is cleared on error
+      showingBanner = false;
     }
   }
 

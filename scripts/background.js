@@ -295,7 +295,7 @@ class CheckBackground {
 
     // CyberDrain integration
     this.policy = null;
-    this.extraWhitelist = new Set();
+    this.extraAllowlist = new Set();
     this.tabHeaders = new Map();
     this.HEADER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
     this.MAX_HEADER_CACHE_ENTRIES = 100;
@@ -454,7 +454,7 @@ class CheckBackground {
     return {
       BrandingName: "CyberDrain Check Phishing Protection",
       BrandingImage: "",
-      ExtraWhitelist: [],
+      ExtraAllowlist: [],
       CIPPReportingServer: "",
       AlertWhenLogon: true,
       ValidPageBadgeImage: "",
@@ -470,8 +470,8 @@ class CheckBackground {
       // Load policy from policy manager
       const policyData = await this.policyManager.getPolicies();
       this.policy = policyData || this.getDefaultPolicy();
-      this.extraWhitelist = new Set(
-        (this.policy?.ExtraWhitelist || [])
+      this.extraAllowlist = new Set(
+        (this.policy?.ExtraAllowlist || [])
           .map((s) => this.urlOrigin(s))
           .filter(Boolean)
       );
@@ -482,7 +482,7 @@ class CheckBackground {
         error
       );
       this.policy = this.getDefaultPolicy();
-      this.extraWhitelist = new Set();
+      this.extraAllowlist = new Set();
     }
   }
 
@@ -506,7 +506,7 @@ class CheckBackground {
         "https://account.microsoft.com",
       ]);
     if (trustedOrigins.has && trustedOrigins.has(origin)) return "trusted";
-    if (this.extraWhitelist.has(origin)) return "trusted-extra";
+    if (this.extraAllowlist.has(origin)) return "trusted-extra";
     return "not-evaluated"; // Changed from "unknown" - don't show badge until we know it's relevant
   }
 
@@ -662,33 +662,6 @@ class CheckBackground {
       }
     } catch (error) {
       console.error("Failed to apply branding to action:", error);
-    }
-  }
-
-  // CyberDrain integration - Send event to reporting server with timeout and proper POST
-  async sendEvent(evt) {
-    if (!this.policy?.CIPPReportingServer) return;
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 5000);
-      const res = await fetch(
-        this.policy.CIPPReportingServer.replace(/\/+$/, "") +
-          "/events/cyberdrain-phish",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            ts: new Date().toISOString(),
-            ua: navigator.userAgent,
-            ...evt,
-          }),
-          signal: ctrl.signal,
-        }
-      );
-      clearTimeout(t);
-      await res.text();
-    } catch {
-      /* best-effort */
     }
   }
 
@@ -1651,7 +1624,7 @@ class CheckBackground {
     const config = (await safe(this.configManager.getConfig())) || {};
     // ONLY log normal page access if debug logging is explicitly enabled
     // Otherwise, only security events (blocked/warnings/threats) should be logged
-    if (!config.enableDebugLogging) {
+    if (config.enableDebugLogging !== true) {
       return; // Skip all routine URL access logging in normal operation
     }
     // If debug logging is enabled, log all page access for debugging purposes
@@ -1705,8 +1678,24 @@ class CheckBackground {
     this.pendingLocal.securityEvents.push(logEntry);
     this.scheduleFlush();
 
-    // Send to CIPP if enabled
-    await this.sendToCipp(logEntry, config);
+    // Send to CIPP if enabled using the correct method
+    if (config?.enableCippReporting && config?.cippServerUrl) {
+      try {
+        await this.handleCippReport({
+          type: logEntry.event.type,
+          severity: logEntry.event.threatLevel || "medium",
+          timestamp: logEntry.timestamp,
+          url: logEntry.event.url,
+          reason: logEntry.event.reason || "Security event logged",
+          tabId: logEntry.tabId,
+          event: logEntry.event,
+          profile: logEntry.profile,
+        });
+      } catch (error) {
+        logger.error("Failed to send event to CIPP:", error);
+        // Don't fail the entire logging operation if CIPP is unavailable
+      }
+    }
   }
 
   enhanceEventForLogging(event) {
@@ -2150,52 +2139,6 @@ class CheckBackground {
       },
       timestamp: profileInfo.timestamp,
     };
-  }
-
-  // Send telemetry data to CIPP
-  async sendToCipp(logEntry, config) {
-    if (!config?.enableCippReporting || !config?.cippServerUrl) {
-      return; // CIPP reporting not enabled
-    }
-
-    try {
-      const cippPayload = {
-        timestamp: logEntry.timestamp,
-        source: "microsoft-365-phishing-protection",
-        version: chrome.runtime.getManifest().version,
-        event: logEntry.event,
-        profile: logEntry.profile,
-        tabId: logEntry.tabId,
-        type: logEntry.type,
-      };
-
-      // Add tenant/organization context if available
-      if (logEntry.profile?.isManaged) {
-        cippPayload.context = "managed";
-      }
-
-      const response = await fetch(`${config.cippServerUrl}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": `Microsoft365PhishingProtection/${
-            chrome.runtime.getManifest().version
-          }`,
-        },
-        body: JSON.stringify(cippPayload),
-      });
-
-      if (!response.ok) {
-        throw new Error(
-          `CIPP server responded with ${response.status}: ${response.statusText}`
-        );
-      }
-
-      logger.log("Successfully sent telemetry to CIPP");
-    } catch (error) {
-      logger.error("Failed to send telemetry to CIPP:", error);
-      // Don't fail the entire logging operation if CIPP is unavailable
-    }
   }
 
   // Handle CIPP reports from content script
