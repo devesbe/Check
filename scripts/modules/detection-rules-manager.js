@@ -3,6 +3,7 @@
  * Handles remote fetching, caching, and management of detection rules
  */
 
+import { chrome, storage } from "../browser-polyfill.js";
 import logger from "../utils/logger.js";
 
 export class DetectionRulesManager {
@@ -53,7 +54,7 @@ export class DetectionRulesManager {
   async loadConfiguration() {
     try {
       // Load from chrome storage to get user configuration
-      const result = await chrome.storage.local.get(["config"]);
+      const result = await storage.local.get(["config"]);
       this.config = result?.config || {};
 
       // Set remote URL from configuration or use default
@@ -82,9 +83,14 @@ export class DetectionRulesManager {
     }
   }
 
+  async reloadConfiguration() {
+    logger.log("DetectionRulesManager: Reloading configuration");
+    await this.loadConfiguration();
+  }
+
   async loadFromCache() {
     try {
-      const result = await chrome.storage.local.get([this.cacheKey]);
+      const result = await storage.local.get([this.cacheKey]);
       const cached = result?.[this.cacheKey];
 
       if (cached && cached.rules && cached.lastUpdate) {
@@ -117,7 +123,7 @@ export class DetectionRulesManager {
         source: this.remoteUrl,
       };
 
-      await chrome.storage.local.set({ [this.cacheKey]: cacheData });
+      await storage.local.set({ [this.cacheKey]: cacheData });
       this.cachedRules = rules;
       this.lastUpdate = cacheData.lastUpdate;
 
@@ -231,6 +237,7 @@ export class DetectionRulesManager {
 
   async forceUpdate() {
     logger.log("Forcing detection rules update");
+    await this.reloadConfiguration();
     return await this.updateDetectionRules();
   }
 
